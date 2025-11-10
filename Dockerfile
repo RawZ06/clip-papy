@@ -5,19 +5,11 @@ WORKDIR /app
 # Install build dependencies for better-sqlite3
 RUN apk add --no-cache python3 make g++
 
-# Install pnpm
-RUN corepack enable && \
-    corepack prepare pnpm@latest --activate
-
 # Copy package files
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json ./
 
-# Create .npmrc to allow build scripts
-RUN echo "enable-pre-post-scripts=true" > .npmrc
-
-# Install production dependencies and rebuild better-sqlite3
-RUN pnpm install --prod --frozen-lockfile && \
-    pnpm rebuild better-sqlite3
+# Install dependencies with npm (not pnpm) for better native module support
+RUN npm install --omit=dev --production
 
 # Copy application code
 COPY index.js ./

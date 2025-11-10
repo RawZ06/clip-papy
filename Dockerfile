@@ -1,25 +1,8 @@
-# Build stage
-FROM node:20-alpine AS builder
-
-WORKDIR /app
-
-# Install build dependencies for better-sqlite3
-RUN apk add --no-cache python3 make g++
-
-# Copy package files
-COPY package.json pnpm-lock.yaml* ./
-
-# Install pnpm and dependencies
-RUN corepack enable && \
-    corepack prepare pnpm@latest --activate && \
-    pnpm install --frozen-lockfile
-
-# Production stage
 FROM node:20-alpine
 
 WORKDIR /app
 
-# Install runtime dependencies for better-sqlite3
+# Install build dependencies for better-sqlite3
 RUN apk add --no-cache python3 make g++
 
 # Install pnpm
@@ -29,8 +12,12 @@ RUN corepack enable && \
 # Copy package files
 COPY package.json pnpm-lock.yaml* ./
 
-# Install production dependencies only and build better-sqlite3
-RUN pnpm install --prod --frozen-lockfile
+# Create .npmrc to allow build scripts
+RUN echo "enable-pre-post-scripts=true" > .npmrc
+
+# Install production dependencies and rebuild better-sqlite3
+RUN pnpm install --prod --frozen-lockfile && \
+    pnpm rebuild better-sqlite3
 
 # Copy application code
 COPY index.js ./

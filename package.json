@@ -1,0 +1,28 @@
+{
+  "name": "papy-clip",
+  "version": "1.0.0",
+  "description": "API de clips Twitch pour papy_grant",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "twitch",
+    "clips",
+    "api"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2",
+    "better-sqlite3": "^11.7.0",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

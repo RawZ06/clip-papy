@@ -1,0 +1,184 @@
+import express from "express";
+import fetch from "node-fetch";
+import Database from "better-sqlite3";
+import cron from "node-cron";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const clientId = process.env.TWITCH_CLIENT_ID;
+const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+const username = process.env.TWITCH_USERNAME;
+
+if (!clientId || !clientSecret || !username) {
+  console.error("❌ Variables d'environnement manquantes (TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_USERNAME)");
+  process.exit(1);
+}
+
+let accessToken = null;
+let db = null;
+
+// --- DB ---
+function initDb() {
+  if (db) return db;
+  const dbPath = process.env.DB_PATH || "./clips.db";
+  db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS clips (
+      id TEXT PRIMARY KEY,
+      url TEXT,
+      title TEXT,
+      game_name TEXT,
+      broadcaster_name TEXT,
+      created_at TEXT,
+      view_count INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_game ON clips (game_name);
+    CREATE INDEX IF NOT EXISTS idx_created ON clips (created_at);
+  `);
+  return db;
+}
+
+// --- Twitch API helpers ---
+async function getAccessToken() {
+  const res = await fetch("https://id.twitch.tv/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error("Impossible d'obtenir un token");
+  accessToken = data.access_token;
+}
+
+async function getBroadcasterId() {
+  const res = await fetch(`https://api.twitch.tv/helix/users?login=${username}`, {
+    headers: { "Client-ID": clientId, "Authorization": `Bearer ${accessToken}` }
+  });
+  const data = await res.json();
+  return data.data?.[0]?.id;
+}
+
+// --- Fetch clips from Twitch and store ---
+async function updateClips() {
+  const database = initDb();
+  if (!accessToken) await getAccessToken();
+
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error("Streamer introuvable");
+
+  let cursor = null;
+  let pages = 0;
+  let inserted = 0;
+
+  console.log("[Cron] Mise à jour des clips Twitch...");
+
+  const insertStmt = database.prepare(`
+    INSERT OR IGNORE INTO clips (id,url,title,game_name,broadcaster_name,created_at,view_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  do {
+    const params = new URLSearchParams({ broadcaster_id: broadcasterId, first: "50" });
+    if (cursor) params.set("after", cursor);
+
+    const res = await fetch(`https://api.twitch.tv/helix/clips?${params}`, {
+      headers: { "Client-ID": clientId, "Authorization": `Bearer ${accessToken}` }
+    });
+
+    if (res.status === 401) {
+      await getAccessToken();
+      continue;
+    }
+
+    const data = await res.json();
+
+    for (const c of data.data || []) {
+      const result = insertStmt.run(
+        c.id,
+        c.url,
+        c.title,
+        c.game_name || "",
+        c.broadcaster_name,
+        c.created_at,
+        c.view_count
+      );
+      if (result.changes > 0) inserted++;
+    }
+
+    cursor = data.pagination?.cursor;
+    pages++;
+    console.log(`[Cron] Clips en cours, (${inserted} nouveaux).`);
+  } while (cursor);
+
+  console.log(`[Cron] Clips mis à jour (${inserted} nouveaux).`);
+}
+
+// --- Express API ---
+const app = express();
+
+app.get("/api/clip", (req, res) => {
+  const database = initDb();
+  const { date, title, game } = req.query;
+
+  let where = [];
+  let params = [];
+
+  const normalize = s => s?.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+  if (date) {
+    const d = date.trim().split("/");
+    let start, end;
+    if (d.length === 3) {
+      const [jj, mm, yyyy] = d.map(Number);
+      start = new Date(yyyy, mm - 1, jj).toISOString();
+      end = new Date(yyyy, mm - 1, jj + 1).toISOString();
+    } else if (d.length === 2) {
+      const [mm, yyyy] = d.map(Number);
+      start = new Date(yyyy, mm - 1, 1).toISOString();
+      end = new Date(yyyy, mm, 1).toISOString();
+    } else if (/^\d{4}$/.test(date)) {
+      const yyyy = Number(date);
+      start = new Date(yyyy, 0, 1).toISOString();
+      end = new Date(yyyy + 1, 0, 1).toISOString();
+    }
+    where.push("created_at BETWEEN ? AND ?");
+    params.push(start, end);
+  }
+
+  if (title) {
+    const t = `%${normalize(title)}%`;
+    where.push("lower(title) LIKE ?");
+    params.push(t);
+  }
+
+  if (game) {
+    const g = `%${normalize(game)}%`;
+    where.push("lower(game_name) LIKE ?");
+    params.push(g);
+  }
+
+  const query = `
+    SELECT * FROM clips
+    ${where.length ? "WHERE " + where.join(" AND ") : ""}
+    ORDER BY RANDOM() LIMIT 1;
+  `;
+  const clip = database.prepare(query).get(...params);
+
+  if (!clip) return res.status(404).send("Aucun clip trouvé pour ces critères.");
+  res.json(clip);
+});
+
+// --- Lancement du cron ---
+const cronSchedule = process.env.CRON_SCHEDULE || "0 */6 * * *";
+console.log(`⏰ Cron configuré: ${cronSchedule}`);
+cron.schedule(cronSchedule, () => {
+  updateClips().catch(err => console.error("Erreur CRON:", err.message));
+});
+
+// --- Démarrage serveur ---
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`🚀 Serveur lancé sur le port ${PORT}`);
+  await updateClips(); // fetch initial
+});

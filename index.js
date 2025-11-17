@@ -230,6 +230,8 @@ async function sendClipToDiscord(clip) {
 
 // --- Check recent clips and notify Discord ---
 async function checkRecentClips() {
+  console.log(`[Check] 🔍 Vérification des nouveaux clips...`);
+
   const database = initDb();
   if (!accessToken) await getAccessToken();
 
@@ -247,6 +249,9 @@ async function checkRecentClips() {
   }
 
   const data = await res.json();
+  const totalClips = data.data?.length || 0;
+  console.log(`[Check] 📥 ${totalClips} clips récupérés depuis l'API`);
+
   let newClips = 0;
 
   const insertStmt = database.prepare(`
@@ -267,13 +272,16 @@ async function checkRecentClips() {
 
     if (result.changes > 0) {
       newClips++;
+      console.log(`[Check] ✨ Nouveau clip détecté: "${c.title}" (${c.id})`);
       // Envoyer sur Discord
       await sendClipToDiscord(c);
     }
   }
 
   if (newClips > 0) {
-    console.log(`[Check] ${newClips} nouveau(x) clip(s) détecté(s) et envoyé(s) sur Discord`);
+    console.log(`[Check] ✅ ${newClips} nouveau(x) clip(s) détecté(s) et envoyé(s) sur Discord`);
+  } else {
+    console.log(`[Check] ℹ️  Aucun nouveau clip`);
   }
 }
 

@@ -114,6 +114,45 @@ async function updateClips() {
   console.log(`[Cron] Clips mis à jour (${inserted} nouveaux).`);
 }
 
+// --- Sync a specific clip by ID ---
+async function syncClipById(clipId) {
+  const database = initDb();
+  if (!accessToken) await getAccessToken();
+
+  const res = await fetch(`https://api.twitch.tv/helix/clips?id=${clipId}`, {
+    headers: { "Client-ID": clientId, "Authorization": `Bearer ${accessToken}` }
+  });
+
+  if (res.status === 401) {
+    await getAccessToken();
+    return syncClipById(clipId);
+  }
+
+  const data = await res.json();
+
+  if (!data.data || data.data.length === 0) {
+    throw new Error("Clip non trouvé");
+  }
+
+  const c = data.data[0];
+  const insertStmt = database.prepare(`
+    INSERT OR REPLACE INTO clips (id,url,title,game_name,broadcaster_name,created_at,view_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  insertStmt.run(
+    c.id,
+    c.url,
+    c.title,
+    c.game_name || "",
+    c.broadcaster_name,
+    c.created_at,
+    c.view_count
+  );
+
+  return c;
+}
+
 // --- Express API ---
 const app = express();
 
@@ -167,6 +206,16 @@ app.get("/api/clip", (req, res) => {
 
   if (!clip) return res.status(404).send("Aucun clip trouvé pour ces critères.");
   res.json(clip);
+});
+
+app.post("/api/sync-clip/:clipId", async (req, res) => {
+  try {
+    const { clipId } = req.params;
+    const clip = await syncClipById(clipId);
+    res.json({ success: true, clip });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // --- Lancement du cron ---

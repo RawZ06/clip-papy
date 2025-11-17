@@ -238,8 +238,15 @@ async function checkRecentClips() {
   const broadcasterId = await getBroadcasterId();
   if (!broadcasterId) throw new Error("Streamer introuvable");
 
-  // Récupérer uniquement la première page (clips les plus récents)
-  const res = await fetch(`https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=20`, {
+  // Récupérer les clips des dernières 24 heures
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const params = new URLSearchParams({
+    broadcaster_id: broadcasterId,
+    first: "100",
+    started_at: yesterday
+  });
+
+  const res = await fetch(`https://api.twitch.tv/helix/clips?${params}`, {
     headers: { "Client-ID": clientId, "Authorization": `Bearer ${accessToken}` }
   });
 

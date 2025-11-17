@@ -18,6 +18,7 @@ if (!clientId || !clientSecret || !username) {
 
 let accessToken = null;
 let db = null;
+let isUpdatingFull = false; // Mutex pour éviter les conflits entre crons
 
 // --- DB ---
 function initDb() {
@@ -62,24 +63,26 @@ async function getBroadcasterId() {
 
 // --- Fetch clips from Twitch and store ---
 async function updateClips() {
-  const database = initDb();
-  if (!accessToken) await getAccessToken();
+  isUpdatingFull = true; // Bloquer les autres crons
+  try {
+    const database = initDb();
+    if (!accessToken) await getAccessToken();
 
-  const broadcasterId = await getBroadcasterId();
-  if (!broadcasterId) throw new Error("Streamer introuvable");
+    const broadcasterId = await getBroadcasterId();
+    if (!broadcasterId) throw new Error("Streamer introuvable");
 
-  let cursor = null;
-  let pages = 0;
-  let inserted = 0;
+    let cursor = null;
+    let pages = 0;
+    let inserted = 0;
 
-  console.log("[Cron] Mise à jour des clips Twitch...");
+    console.log("[Cron Full] Mise à jour complète des clips Twitch...");
 
-  const insertStmt = database.prepare(`
-    INSERT OR IGNORE INTO clips (id,url,title,game_name,broadcaster_name,created_at,view_count)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
+    const insertStmt = database.prepare(`
+      INSERT OR IGNORE INTO clips (id,url,title,game_name,broadcaster_name,created_at,view_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
 
-  do {
+    do {
     const params = new URLSearchParams({ broadcaster_id: broadcasterId, first: "50" });
     if (cursor) params.set("after", cursor);
 
@@ -107,12 +110,15 @@ async function updateClips() {
       if (result.changes > 0) inserted++;
     }
 
-    cursor = data.pagination?.cursor;
-    pages++;
-    console.log(`[Cron] Clips en cours, (${inserted} nouveaux).`);
-  } while (cursor);
+      cursor = data.pagination?.cursor;
+      pages++;
+      console.log(`[Cron Full] Clips en cours, (${inserted} nouveaux).`);
+    } while (cursor);
 
-  console.log(`[Cron] Clips mis à jour (${inserted} nouveaux).`);
+    console.log(`[Cron Full] Clips mis à jour (${inserted} nouveaux).`);
+  } finally {
+    isUpdatingFull = false; // Débloquer
+  }
 }
 
 // --- Sync a specific clip by ID ---
@@ -175,12 +181,7 @@ async function sendClipToDiscord(clip) {
 
   try {
     const embed = {
-      title: clip.title || "Nouveau clip !",
-      url: clip.url,
       color: 0x9146FF,
-      thumbnail: {
-        url: clip.thumbnail_url || ""
-      },
       fields: [
         {
           name: "Créateur",
@@ -197,12 +198,7 @@ async function sendClipToDiscord(clip) {
           value: `${clip.duration || 0}s`,
           inline: true
         }
-      ],
-      timestamp: clip.created_at,
-      footer: {
-        text: `${clip.broadcaster_name} • Twitch`,
-        icon_url: "https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png"
-      }
+      ]
     };
 
     if (clip.game_name) {
@@ -217,7 +213,7 @@ async function sendClipToDiscord(clip) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        content: `🎬 **Nouveau clip créé !**`,
+        content: `🎬 **Nouveau clip créé !**\n${clip.url}`,
         embeds: [embed]
       })
     });
@@ -230,9 +226,23 @@ async function sendClipToDiscord(clip) {
 
 // --- Check recent clips and notify Discord ---
 async function checkRecentClips() {
+  // Ne pas exécuter si le cron full est en cours
+  if (isUpdatingFull) {
+    console.log(`[Check] ⏸️  Cron full en cours, attente...`);
+    return;
+  }
+
   console.log(`[Check] 🔍 Vérification des nouveaux clips...`);
 
   const database = initDb();
+
+  // Vérifier que la base n'est pas vide
+  const count = database.prepare("SELECT COUNT(*) as count FROM clips").get();
+  if (count.count === 0) {
+    console.log(`[Check] ⚠️  Base de données vide, attente de la première synchronisation complète...`);
+    return;
+  }
+
   if (!accessToken) await getAccessToken();
 
   const broadcasterId = await getBroadcasterId();
@@ -261,27 +271,35 @@ async function checkRecentClips() {
 
   let newClips = 0;
 
+  // Vérifier si le clip existe déjà
+  const existsStmt = database.prepare("SELECT id FROM clips WHERE id = ?");
   const insertStmt = database.prepare(`
     INSERT OR IGNORE INTO clips (id,url,title,game_name,broadcaster_name,created_at,view_count)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
 
   for (const c of data.data || []) {
-    const result = insertStmt.run(
-      c.id,
-      c.url,
-      c.title,
-      c.game_name || "",
-      c.broadcaster_name,
-      c.created_at,
-      c.view_count
-    );
+    // Vérifier si le clip existe AVANT d'insérer
+    const exists = existsStmt.get(c.id);
 
-    if (result.changes > 0) {
-      newClips++;
-      console.log(`[Check] ✨ Nouveau clip détecté: "${c.title}" (${c.id})`);
-      // Envoyer sur Discord
-      await sendClipToDiscord(c);
+    if (!exists) {
+      // Nouveau clip : insérer ET envoyer sur Discord
+      const result = insertStmt.run(
+        c.id,
+        c.url,
+        c.title,
+        c.game_name || "",
+        c.broadcaster_name,
+        c.created_at,
+        c.view_count
+      );
+
+      if (result.changes > 0) {
+        newClips++;
+        console.log(`[Check] ✨ Nouveau clip détecté: "${c.title}" (${c.id})`);
+        // Envoyer sur Discord uniquement pour les VRAIMENT nouveaux clips
+        await sendClipToDiscord(c);
+      }
     }
   }
 

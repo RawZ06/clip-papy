@@ -3,12 +3,16 @@ import fetch from "node-fetch";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 dotenv.config();
 
 const clientId = process.env.TWITCH_CLIENT_ID;
 const clientSecret = process.env.TWITCH_CLIENT_SECRET;
 const username = process.env.TWITCH_USERNAME;
+const webhookSecret = process.env.TWITCH_WEBHOOK_SECRET || crypto.randomBytes(32).toString("hex");
+const webhookCallbackUrl = process.env.WEBHOOK_CALLBACK_URL;
+const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 
 if (!clientId || !clientSecret || !username) {
   console.error("❌ Variables d'environnement manquantes (TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_USERNAME)");
@@ -153,8 +157,172 @@ async function syncClipById(clipId) {
   return c;
 }
 
+// --- Discord notification ---
+async function sendClipToDiscord(clip) {
+  if (!discordWebhookUrl) {
+    return;
+  }
+
+  try {
+    const embed = {
+      title: clip.title || "Nouveau clip !",
+      url: clip.url,
+      color: 0x9146FF,
+      thumbnail: {
+        url: clip.thumbnail_url || ""
+      },
+      fields: [
+        {
+          name: "Créateur",
+          value: clip.creator_name || "Inconnu",
+          inline: true
+        },
+        {
+          name: "Vues",
+          value: String(clip.view_count || 0),
+          inline: true
+        },
+        {
+          name: "Durée",
+          value: `${clip.duration || 0}s`,
+          inline: true
+        }
+      ],
+      timestamp: clip.created_at,
+      footer: {
+        text: `${clip.broadcaster_name} • Twitch`,
+        icon_url: "https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png"
+      }
+    };
+
+    if (clip.game_name) {
+      embed.fields.push({
+        name: "Jeu",
+        value: clip.game_name,
+        inline: true
+      });
+    }
+
+    await fetch(discordWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: `🎬 **Nouveau clip créé !**`,
+        embeds: [embed]
+      })
+    });
+
+    console.log(`[Discord] Clip ${clip.id} envoyé sur Discord`);
+  } catch (err) {
+    console.error(`[Discord] Erreur lors de l'envoi:`, err.message);
+  }
+}
+
+// --- EventSub Webhook ---
+async function subscribeToClipCreated(broadcasterId) {
+  if (!webhookCallbackUrl) {
+    console.log("⚠️  WEBHOOK_CALLBACK_URL non défini, webhook non activé");
+    return;
+  }
+
+  if (!accessToken) await getAccessToken();
+
+  const body = {
+    type: "clip.create",
+    version: "1",
+    condition: {
+      broadcaster_user_id: broadcasterId
+    },
+    transport: {
+      method: "webhook",
+      callback: webhookCallbackUrl,
+      secret: webhookSecret
+    }
+  };
+
+  const res = await fetch("https://api.twitch.tv/helix/eventsub/subscriptions", {
+    method: "POST",
+    headers: {
+      "Client-ID": clientId,
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  const data = await res.json();
+
+  if (res.status === 202) {
+    console.log("✅ Webhook EventSub enregistré pour clip.create");
+  } else if (res.status === 409) {
+    console.log("ℹ️  Webhook EventSub déjà enregistré");
+  } else {
+    console.error("❌ Erreur webhook:", data);
+  }
+}
+
+function verifyTwitchSignature(req) {
+  const messageId = req.headers["twitch-eventsub-message-id"];
+  const timestamp = req.headers["twitch-eventsub-message-timestamp"];
+  const signature = req.headers["twitch-eventsub-message-signature"];
+  const body = JSON.stringify(req.body);
+
+  const hmac = crypto.createHmac("sha256", webhookSecret);
+  hmac.update(messageId + timestamp + body);
+  const expectedSignature = "sha256=" + hmac.digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedSignature)
+  );
+}
+
 // --- Express API ---
 const app = express();
+app.use(express.json());
+
+// Webhook EventSub endpoint
+app.post("/webhook/eventsub", async (req, res) => {
+  const messageType = req.headers["twitch-eventsub-message-type"];
+
+  // Vérification de la signature
+  if (!verifyTwitchSignature(req)) {
+    console.error("❌ Signature webhook invalide");
+    return res.status(403).send("Forbidden");
+  }
+
+  // Challenge de vérification
+  if (messageType === "webhook_callback_verification") {
+    console.log("✅ Webhook vérifié par Twitch");
+    return res.status(200).send(req.body.challenge);
+  }
+
+  // Notification d'événement
+  if (messageType === "notification") {
+    const event = req.body.event;
+    console.log(`[Webhook] Nouveau clip créé: ${event.id}`);
+
+    try {
+      const clip = await syncClipById(event.id);
+      console.log(`[Webhook] Clip ${event.id} synchronisé avec succès`);
+
+      // Envoyer le clip sur Discord
+      await sendClipToDiscord(clip);
+    } catch (err) {
+      console.error(`[Webhook] Erreur sync clip ${event.id}:`, err.message);
+    }
+
+    return res.status(200).send("OK");
+  }
+
+  // Révocation
+  if (messageType === "revocation") {
+    console.log("⚠️  Webhook révoqué par Twitch:", req.body.subscription.status);
+    return res.status(200).send("OK");
+  }
+
+  res.status(200).send("OK");
+});
 
 app.get("/api/clip", (req, res) => {
   const database = initDb();
@@ -240,4 +408,14 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Serveur lancé sur le port ${PORT}`);
   await updateClips(); // fetch initial
+
+  // Enregistrer le webhook
+  if (webhookCallbackUrl) {
+    try {
+      const broadcasterId = await getBroadcasterId();
+      await subscribeToClipCreated(broadcasterId);
+    } catch (err) {
+      console.error("❌ Erreur lors de l'enregistrement du webhook:", err.message);
+    }
+  }
 });

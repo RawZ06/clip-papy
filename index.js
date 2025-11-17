@@ -208,6 +208,16 @@ app.get("/api/clip", (req, res) => {
   res.json(clip);
 });
 
+app.get("/api/sync-clip/:clipId", async (req, res) => {
+  try {
+    const { clipId } = req.params;
+    const clip = await syncClipById(clipId);
+    res.json({ success: true, clip });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.post("/api/sync-clip/:clipId", async (req, res) => {
   try {
     const { clipId } = req.params;

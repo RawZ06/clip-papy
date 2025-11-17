@@ -3,15 +3,12 @@ import fetch from "node-fetch";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import dotenv from "dotenv";
-import crypto from "crypto";
 
 dotenv.config();
 
 const clientId = process.env.TWITCH_CLIENT_ID;
 const clientSecret = process.env.TWITCH_CLIENT_SECRET;
 const username = process.env.TWITCH_USERNAME;
-const webhookSecret = process.env.TWITCH_WEBHOOK_SECRET || crypto.randomBytes(32).toString("hex");
-const webhookCallbackUrl = process.env.WEBHOOK_CALLBACK_URL;
 const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL;
 
 if (!clientId || !clientSecret || !username) {
@@ -157,6 +154,19 @@ async function syncClipById(clipId) {
   return c;
 }
 
+// --- Check if streamer is live ---
+async function isStreamerLive() {
+  if (!accessToken) await getAccessToken();
+
+  const broadcasterId = await getBroadcasterId();
+  const res = await fetch(`https://api.twitch.tv/helix/streams?user_id=${broadcasterId}`, {
+    headers: { "Client-ID": clientId, "Authorization": `Bearer ${accessToken}` }
+  });
+
+  const data = await res.json();
+  return data.data && data.data.length > 0;
+}
+
 // --- Discord notification ---
 async function sendClipToDiscord(clip) {
   if (!discordWebhookUrl) {
@@ -218,111 +228,57 @@ async function sendClipToDiscord(clip) {
   }
 }
 
-// --- EventSub Webhook ---
-async function subscribeToClipCreated(broadcasterId) {
-  if (!webhookCallbackUrl) {
-    console.log("⚠️  WEBHOOK_CALLBACK_URL non défini, webhook non activé");
-    return;
-  }
-
+// --- Check recent clips and notify Discord ---
+async function checkRecentClips() {
+  const database = initDb();
   if (!accessToken) await getAccessToken();
 
-  const body = {
-    type: "clip.create",
-    version: "1",
-    condition: {
-      broadcaster_user_id: broadcasterId
-    },
-    transport: {
-      method: "webhook",
-      callback: webhookCallbackUrl,
-      secret: webhookSecret
-    }
-  };
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error("Streamer introuvable");
 
-  const res = await fetch("https://api.twitch.tv/helix/eventsub/subscriptions", {
-    method: "POST",
-    headers: {
-      "Client-ID": clientId,
-      "Authorization": `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
+  // Récupérer uniquement la première page (clips les plus récents)
+  const res = await fetch(`https://api.twitch.tv/helix/clips?broadcaster_id=${broadcasterId}&first=20`, {
+    headers: { "Client-ID": clientId, "Authorization": `Bearer ${accessToken}` }
   });
 
-  const data = await res.json();
-
-  if (res.status === 202) {
-    console.log("✅ Webhook EventSub enregistré pour clip.create");
-  } else if (res.status === 409) {
-    console.log("ℹ️  Webhook EventSub déjà enregistré");
-  } else {
-    console.error("❌ Erreur webhook:", data);
+  if (res.status === 401) {
+    await getAccessToken();
+    return checkRecentClips();
   }
-}
 
-function verifyTwitchSignature(req) {
-  const messageId = req.headers["twitch-eventsub-message-id"];
-  const timestamp = req.headers["twitch-eventsub-message-timestamp"];
-  const signature = req.headers["twitch-eventsub-message-signature"];
-  const body = JSON.stringify(req.body);
+  const data = await res.json();
+  let newClips = 0;
 
-  const hmac = crypto.createHmac("sha256", webhookSecret);
-  hmac.update(messageId + timestamp + body);
-  const expectedSignature = "sha256=" + hmac.digest("hex");
+  const insertStmt = database.prepare(`
+    INSERT OR IGNORE INTO clips (id,url,title,game_name,broadcaster_name,created_at,view_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
 
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expectedSignature)
-  );
+  for (const c of data.data || []) {
+    const result = insertStmt.run(
+      c.id,
+      c.url,
+      c.title,
+      c.game_name || "",
+      c.broadcaster_name,
+      c.created_at,
+      c.view_count
+    );
+
+    if (result.changes > 0) {
+      newClips++;
+      // Envoyer sur Discord
+      await sendClipToDiscord(c);
+    }
+  }
+
+  if (newClips > 0) {
+    console.log(`[Check] ${newClips} nouveau(x) clip(s) détecté(s) et envoyé(s) sur Discord`);
+  }
 }
 
 // --- Express API ---
 const app = express();
-app.use(express.json());
-
-// Webhook EventSub endpoint
-app.post("/webhook/eventsub", async (req, res) => {
-  const messageType = req.headers["twitch-eventsub-message-type"];
-
-  // Vérification de la signature
-  if (!verifyTwitchSignature(req)) {
-    console.error("❌ Signature webhook invalide");
-    return res.status(403).send("Forbidden");
-  }
-
-  // Challenge de vérification
-  if (messageType === "webhook_callback_verification") {
-    console.log("✅ Webhook vérifié par Twitch");
-    return res.status(200).send(req.body.challenge);
-  }
-
-  // Notification d'événement
-  if (messageType === "notification") {
-    const event = req.body.event;
-    console.log(`[Webhook] Nouveau clip créé: ${event.id}`);
-
-    try {
-      const clip = await syncClipById(event.id);
-      console.log(`[Webhook] Clip ${event.id} synchronisé avec succès`);
-
-      // Envoyer le clip sur Discord
-      await sendClipToDiscord(clip);
-    } catch (err) {
-      console.error(`[Webhook] Erreur sync clip ${event.id}:`, err.message);
-    }
-
-    return res.status(200).send("OK");
-  }
-
-  // Révocation
-  if (messageType === "revocation") {
-    console.log("⚠️  Webhook révoqué par Twitch:", req.body.subscription.status);
-    return res.status(200).send("OK");
-  }
-
-  res.status(200).send("OK");
-});
 
 app.get("/api/clip", (req, res) => {
   const database = initDb();
@@ -396,26 +352,59 @@ app.post("/api/sync-clip/:clipId", async (req, res) => {
   }
 });
 
-// --- Lancement du cron ---
-const cronSchedule = process.env.CRON_SCHEDULE || "0 */6 * * *";
-console.log(`⏰ Cron configuré: ${cronSchedule}`);
-cron.schedule(cronSchedule, () => {
-  updateClips().catch(err => console.error("Erreur CRON:", err.message));
+// --- Cron jobs ---
+
+// Cron 1: Mise à jour complète de tous les clips (toutes les 6 heures)
+const fullUpdateSchedule = process.env.FULL_UPDATE_CRON || "0 */6 * * *";
+console.log(`⏰ Cron mise à jour complète: ${fullUpdateSchedule}`);
+cron.schedule(fullUpdateSchedule, () => {
+  console.log("[Cron Full] Démarrage de la mise à jour complète...");
+  updateClips().catch(err => console.error("Erreur CRON Full:", err.message));
 });
+
+// Cron 2: Vérification des nouveaux clips (adaptatif selon si en live ou non)
+let isLive = false;
+let checkInterval = null;
+
+async function startAdaptiveChecking() {
+  const checkStatus = async () => {
+    try {
+      const wasLive = isLive;
+      isLive = await isStreamerLive();
+
+      if (isLive !== wasLive) {
+        console.log(`[Cron Check] Statut changé: ${isLive ? "🔴 EN LIVE" : "⚫ HORS LIGNE"}`);
+        // Redémarrer le cron avec la bonne fréquence
+        if (checkInterval) {
+          checkInterval.stop();
+        }
+
+        const schedule = isLive ? "* * * * *" : "0 * * * *"; // 1 minute si live, 1 heure sinon
+        console.log(`[Cron Check] Nouvelle fréquence: ${isLive ? "toutes les minutes" : "toutes les heures"}`);
+
+        checkInterval = cron.schedule(schedule, async () => {
+          await checkRecentClips().catch(err => console.error("Erreur CRON Check:", err.message));
+        });
+      }
+
+      await checkRecentClips();
+    } catch (err) {
+      console.error("Erreur lors de la vérification du statut:", err.message);
+    }
+  };
+
+  // Vérification initiale
+  await checkStatus();
+
+  // Vérifier le statut live toutes les 5 minutes
+  cron.schedule("*/5 * * * *", checkStatus);
+}
+
+startAdaptiveChecking();
 
 // --- Démarrage serveur ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Serveur lancé sur le port ${PORT}`);
   await updateClips(); // fetch initial
-
-  // Enregistrer le webhook
-  if (webhookCallbackUrl) {
-    try {
-      const broadcasterId = await getBroadcasterId();
-      await subscribeToClipCreated(broadcasterId);
-    } catch (err) {
-      console.error("❌ Erreur lors de l'enregistrement du webhook:", err.message);
-    }
-  }
 });

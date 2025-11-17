@@ -110,12 +110,47 @@ async function updateClips() {
       if (result.changes > 0) inserted++;
     }
 
-      cursor = data.pagination?.cursor;
+        cursor = data.pagination?.cursor;
       pages++;
       console.log(`[Cron Full] Clips en cours, (${inserted} nouveaux).`);
     } while (cursor);
 
     console.log(`[Cron Full] Clips mis à jour (${inserted} nouveaux).`);
+
+    // Étape finale : vérifier les clips des dernières 24h avec started_at pour être sûr
+    console.log(`[Cron Full] Vérification finale des clips des dernières 24h...`);
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const finalParams = new URLSearchParams({
+      broadcaster_id: broadcasterId,
+      first: "100",
+      started_at: yesterday
+    });
+
+    const finalRes = await fetch(`https://api.twitch.tv/helix/clips?${finalParams}`, {
+      headers: { "Client-ID": clientId, "Authorization": `Bearer ${accessToken}` }
+    });
+
+    const finalData = await finalRes.json();
+    let finalInserted = 0;
+
+    for (const c of finalData.data || []) {
+      const result = insertStmt.run(
+        c.id,
+        c.url,
+        c.title,
+        c.game_name || "",
+        c.broadcaster_name,
+        c.created_at,
+        c.view_count
+      );
+      if (result.changes > 0) finalInserted++;
+    }
+
+    if (finalInserted > 0) {
+      console.log(`[Cron Full] ${finalInserted} clips récents supplémentaires ajoutés.`);
+    } else {
+      console.log(`[Cron Full] Aucun clip récent manquant.`);
+    }
   } finally {
     isUpdatingFull = false; // Débloquer
   }
@@ -181,7 +216,12 @@ async function sendClipToDiscord(clip) {
 
   try {
     const embed = {
+      title: clip.title || "Nouveau clip !",
+      url: clip.url,
       color: 0x9146FF,
+      thumbnail: {
+        url: clip.thumbnail_url || ""
+      },
       fields: [
         {
           name: "Créateur",
@@ -198,7 +238,12 @@ async function sendClipToDiscord(clip) {
           value: `${clip.duration || 0}s`,
           inline: true
         }
-      ]
+      ],
+      timestamp: clip.created_at,
+      footer: {
+        text: `${clip.broadcaster_name} • Twitch`,
+        icon_url: "https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png"
+      }
     };
 
     if (clip.game_name) {
@@ -213,7 +258,7 @@ async function sendClipToDiscord(clip) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        content: `🎬 **Nouveau clip créé !**\n${clip.url}`,
+        content: `🎬 **Nouveau clip créé !**`,
         embeds: [embed]
       })
     });

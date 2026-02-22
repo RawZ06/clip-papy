@@ -3,6 +3,7 @@ import fetch from "node-fetch";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import dotenv from "dotenv";
+import levenshtein from "fast-levenshtein"; 
 
 dotenv.config();
 
@@ -25,6 +26,13 @@ function initDb() {
   if (db) return db;
   const dbPath = process.env.DB_PATH || "./clips.db";
   db = new Database(dbPath);
+
+    // Enregistrement de la fonction personnalisée pour SQLite
+  db.function('lev', (a, b) => {
+    if (!a || !b) return 999;
+    return levenshtein.get(String(a).toLowerCase(), String(b).toLowerCase());
+  });
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS clips (
       id TEXT PRIMARY KEY,
@@ -360,52 +368,103 @@ const app = express();
 
 app.get("/api/clip", (req, res) => {
   const database = initDb();
+  
   const { date, title, game } = req.query;
-
-  let where = [];
-  let params = [];
-
   const normalize = s => s?.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-
-  if (date) {
-    const d = date.trim().split("/");
-    let start, end;
-    if (d.length === 3) {
-      const [jj, mm, yyyy] = d.map(Number);
-      start = new Date(yyyy, mm - 1, jj).toISOString();
-      end = new Date(yyyy, mm - 1, jj + 1).toISOString();
-    } else if (d.length === 2) {
-      const [mm, yyyy] = d.map(Number);
-      start = new Date(yyyy, mm - 1, 1).toISOString();
-      end = new Date(yyyy, mm, 1).toISOString();
-    } else if (/^\d{4}$/.test(date)) {
-      const yyyy = Number(date);
-      start = new Date(yyyy, 0, 1).toISOString();
-      end = new Date(yyyy + 1, 0, 1).toISOString();
+  
+  // Fonction pour construire la requête
+  const buildQuery = (useFuzzy = false) => {
+    let where = [];
+    let params = [];
+    
+    if (date) {
+      const d = date.trim().split("/");
+      let start, end;
+      if (d.length === 3) {
+        const [jj, mm, yyyy] = d.map(Number);
+        start = new Date(yyyy, mm - 1, jj).toISOString();
+        end = new Date(yyyy, mm - 1, jj + 1).toISOString();
+      } else if (d.length === 2) {
+        const [mm, yyyy] = d.map(Number);
+        start = new Date(yyyy, mm - 1, 1).toISOString();
+        end = new Date(yyyy, mm, 1).toISOString();
+      } else if (/^\d{4}$/.test(date)) {
+        const yyyy = Number(date);
+        start = new Date(yyyy, 0, 1).toISOString();
+        end = new Date(yyyy + 1, 0, 1).toISOString();
+      }
+      where.push("created_at BETWEEN ? AND ?");
+      params.push(start, end);
     }
-    where.push("created_at BETWEEN ? AND ?");
-    params.push(start, end);
+    
+    // Recherche sur le titre
+    if (title) {
+      const normalizedTitle = normalize(title);
+      const keywords = normalizedTitle.split(/\s+/).filter(word => word.length > 0);
+      
+      if (!useFuzzy) {
+        // PASSE 1 : Recherche exacte avec LIKE uniquement
+        const keywordConditions = keywords.map(keyword => {
+          params.push(`%${keyword}%`);
+          return `lower(title) LIKE ?`;
+        });
+        where.push(`(${keywordConditions.join(' AND ')})`);
+      } else {
+        // PASSE 2 : Recherche fuzzy avec Levenshtein
+        const keywordConditions = keywords.map(keyword => {
+          const threshold = keyword.length <= 3 ? 1 : keyword.length <= 6 ? 2 : 3;
+          params.push(`%${keyword}%`, keyword, threshold);
+          
+          return `(
+            lower(title) LIKE ?
+            OR (
+              SELECT MIN(lev(?, word))
+              FROM (
+                SELECT TRIM(value) as word
+                FROM (
+                  WITH RECURSIVE split(word, str) AS (
+                    SELECT '', lower(title) || ' '
+                    UNION ALL
+                    SELECT SUBSTR(str, 0, INSTR(str, ' ')),
+                           SUBSTR(str, INSTR(str, ' ') + 1)
+                    FROM split WHERE str != ''
+                  )
+                  SELECT word as value FROM split WHERE word != ''
+                )
+              )
+            ) <= ?
+          )`;
+        });
+        where.push(`(${keywordConditions.join(' AND ')})`);
+      }
+    }
+    
+    if (game) {
+      const g = `%${normalize(game)}%`;
+      where.push("lower(game_name) LIKE ?");
+      params.push(g);
+    }
+    
+    return {
+      query: `
+        SELECT * FROM clips
+        ${where.length ? "WHERE " + where.join(" AND ") : ""}
+        ORDER BY RANDOM() LIMIT 1;
+      `,
+      params
+    };
+  };
+  
+  // PASSE 1 : Recherche exacte
+  let { query, params } = buildQuery(false);
+  let clip = database.prepare(query).get(...params);
+  
+  // PASSE 2 : Si aucun résultat, recherche fuzzy
+  if (!clip && title) {
+    ({ query, params } = buildQuery(true));
+    clip = database.prepare(query).get(...params);
   }
-
-  if (title) {
-    const t = `%${normalize(title)}%`;
-    where.push("lower(title) LIKE ?");
-    params.push(t);
-  }
-
-  if (game) {
-    const g = `%${normalize(game)}%`;
-    where.push("lower(game_name) LIKE ?");
-    params.push(g);
-  }
-
-  const query = `
-    SELECT * FROM clips
-    ${where.length ? "WHERE " + where.join(" AND ") : ""}
-    ORDER BY RANDOM() LIMIT 1;
-  `;
-  const clip = database.prepare(query).get(...params);
-
+  
   if (!clip) return res.status(404).send("Aucun clip trouvé pour ces critères.");
   res.json(clip);
 });
